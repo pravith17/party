@@ -66,7 +66,13 @@ async function deletePhoto(url){
 }
 async function uploadedImageStream(upload){
  const cursor=PhotoUploadPart.find({uploadId:upload._id}).sort({index:1}).select('data').lean().cursor();
- return Readable.from((async function*(){for await(const part of cursor)yield part.data;})());
+ return Readable.from((async function*(){for await(const part of cursor){
+  const data=part.data;
+  if(Buffer.isBuffer(data))yield data;
+  else if(data?._bsontype==='Binary'&&data.buffer instanceof Uint8Array)yield Buffer.from(data.buffer.subarray(0,data.position));
+  else if(data instanceof Uint8Array)yield Buffer.from(data);
+  else throw new TypeError('MongoDB returned photo bytes in an unsupported format.');
+ }})());
 }
 app.get('/api/upload-config',admin,(req,res)=>res.json({database:!demoMode}));
 app.post('/api/photo-uploads',admin,csrf,async(req,res)=>{
