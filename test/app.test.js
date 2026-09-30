@@ -1,0 +1,96 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { once } from 'node:events';
+import { chromium } from '@playwright/test';
+import { slugify, validSlug, youtubeId } from '../lib.js';
+
+test('Invitation URL and YouTube validation',()=>{
+ assert.equal(slugify('Aditya & Shréya!'),'aditya-shreya');
+ for(const s of ['admin','api','demo','../secret','a b','-guest','guest-']) assert.equal(validSlug(s),false,s);
+ assert.equal(validSlug('priya-17'),true);
+ assert.equal(youtubeId('https://youtu.be/dQw4w9WgXcQ'),'dQw4w9WgXcQ');
+ assert.equal(youtubeId('https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=2'),'dQw4w9WgXcQ');
+ assert.equal(youtubeId('https://evil.com/watch?v=dQw4w9WgXcQ'),null);
+ assert.equal(youtubeId('javascript:alert(1)'),null);
+});
+
+test('Admin and guest journeys, photos, RSVP persistence, and responsive layouts', {timeout:120000},async()=>{
+ const uploadDir=await mkdtemp(path.join(tmpdir(),'birthday-test-'));
+ const server=spawn(process.execPath,['server.js'],{env:{...process.env,UPLOAD_DIR:uploadDir,DEMO_MODE:'true',PORT:'3001',PUBLIC_URL:'http://localhost:3001',ADMIN_USERNAME:'test-host',ADMIN_PASSWORD:'test-password',SESSION_SECRET:'isolated-test-secret-1234567890',NODE_ENV:'test'},stdio:['ignore','pipe','pipe']});
+ let browser, page, slug='test-guest';
+ try{
+ await Promise.race([once(server.stdout,'data'),new Promise((_,reject)=>setTimeout(()=>reject(Error('Test server did not start')),15000).unref())]);
+ browser=await chromium.launch({headless:true});
+ const context=await browser.newContext({viewport:{width:1440,height:1000}});page=await context.newPage();page.setDefaultTimeout(12000);const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const unauth=await context.request.get('http://localhost:3001/api/invites');assert.equal(unauth.status(),401);
+ await page.goto('http://localhost:3001/admin');
+ await page.getByLabel('Username',{exact:true}).fill('test-host');await page.getByLabel('Password',{exact:true}).fill('test-password');await page.getByRole('button',{name:'Let’s plan a party'}).click();
+ await page.getByRole('button',{name:'New invitation'}).click();
+ await page.getByLabel('Guest’s name').fill('Test Guest');await page.getByLabel('About this person').fill('Our favourite storyteller.');await page.getByLabel('Profile picture',{exact:true}).setInputFiles('public/assets/hero-img.jpg');
+ await page.getByLabel('A personal message').fill('A special invitation just for you.');
+ await page.getByRole('button',{name:'Create invitation'}).click();
+ await page.getByAltText('Current profile picture').waitFor();await page.getByLabel('Add JPG, PNG or WebP photos').setInputFiles('public/assets/hero-img.jpg');
+ await page.getByRole('button',{name:'Upload photos'}).click();
+ await page.getByRole('button',{name:'Remove photo',exact:true}).waitFor();
+ await page.getByRole('button',{name:'Close dialog'}).click();
+ await page.getByRole('button',{name:'Party settings',exact:true}).click();
+ await page.getByLabel('Venue name').fill('The Birthday Terrace');
+ await page.getByLabel('Exact address & directions').fill('42 Celebration Street');
+ await page.getByLabel('Party date').fill('2026-10-17');
+ await page.getByLabel('Start time').fill('19:00');
+ await page.getByLabel('Map link').fill('https://maps.google.com/?q=party');
+ await page.getByRole('button',{name:'Save party details'}).click();
+ await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('Party details saved'));
+ const session=await (await context.request.get('http://localhost:3001/api/session')).json();
+ const blocked=await context.request.post('http://localhost:3001/api/invites',{data:{name:'X',slug:'x'}});assert.equal(blocked.status(),403);
+ const duplicate=await context.request.post('http://localhost:3001/api/invites',{headers:{'x-csrf-token':session.csrf},data:{name:'Test Guest',slug}});assert.equal(duplicate.status(),409);
+ const guest=await browser.newPage({viewport:{width:1440,height:1000}});guest.setDefaultTimeout(12000);guest.on('pageerror',e=>errors.push(e.message));
+ await guest.goto('http://localhost:3001/'+slug);
+ await guest.getByRole('heading',{name:'Dear Test Guest,'}).waitFor();await guest.getByText('Our favourite storyteller.',{exact:true}).waitFor();assert.equal(await guest.locator('.guest-portrait').evaluate(el=>el.complete&&el.naturalWidth>0),true);await guest.getByText('Be the first to confirm. We’d love to see you here.',{exact:true}).waitFor();
+ assert.equal(await guest.locator('.photo-hero img').evaluate(el=>el.complete&&el.naturalWidth>0),true);
+ await guest.locator('#rsvp').scrollIntoViewIfNeeded();await guest.locator('#the-plan').scrollIntoViewIfNeeded();await guest.evaluate(()=>scrollTo(0,0));await guest.screenshot({path:'/tmp/birthday-desktop.png',fullPage:true,animations:'disabled'});
+ await guest.setViewportSize({width:390,height:844});await guest.screenshot({path:'/tmp/birthday-mobile-before.png',fullPage:true});
+ for(let i=0;i<3;i++){await guest.getByRole('button',{name:'I can’t make it',exact:true}).click();assert.equal(await guest.locator('#decline-form').count(),0);}
+ await guest.getByRole('button',{name:'I can’t make it',exact:true}).click();
+ await guest.getByLabel('Why are you not attending?').fill('Travelling with family.');
+ await guest.getByLabel('When are you free for a rain check?').fill('Next Sunday');
+ for(let i=0;i<3;i++){await guest.getByRole('button',{name:'I really can’t attend',exact:true}).click();assert.equal(await guest.locator('#decline-form').count(),1);}
+ await guest.getByRole('button',{name:'I really can’t attend',exact:true}).click();
+ await guest.getByText('YOUR RESPONSE HAS BEEN SAVED',{exact:true}).waitFor();
+ assert.equal(await guest.locator('.photo-wall img').count(),1);
+ await guest.getByRole('button',{name:'Okay, I’ll attend!'}).click();
+ await guest.getByRole('heading',{name:'Thank you, Test Guest.'}).waitFor();
+ await guest.getByRole('heading',{name:'The Birthday Terrace'}).waitFor();await guest.locator('.attendee-names').getByText('Test Guest',{exact:true}).waitFor();const publicGuests=await (await guest.request.get('http://localhost:3001/api/attendees')).json();assert.deepEqual(publicGuests,[{name:'Test Guest'}]);
+ const records=await (await context.request.get('http://localhost:3001/api/invites')).json();assert.equal(records[0].status,'attending');assert.equal(records[0].responseHistory.length,2);assert.equal(records[0].responseHistory[0].freeWhen,'Next Sunday');
+ await guest.getByRole('button',{name:'Back to your invitation'}).click();await guest.locator('.attendee-names').getByText('Test Guest',{exact:true}).waitFor();
+ await guest.setViewportSize({width:390,height:844});await guest.locator('#rsvp').scrollIntoViewIfNeeded();await guest.locator('#the-plan').scrollIntoViewIfNeeded();await guest.evaluate(()=>scrollTo(0,0));await guest.screenshot({path:'/tmp/birthday-mobile.png',fullPage:true,animations:'disabled'});
+ assert.equal(await guest.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'Mobile should not overflow horizontally');
+ assert.equal(await guest.locator('#theme').count(),0);
+ assert.equal(await guest.locator('#attend').count(),0);
+ assert.equal(await guest.locator('#decline').count(),0);
+ await guest.reload();await guest.getByRole('heading',{name:'You’re on the guest list.'}).waitFor();
+ const denied=await guest.request.post('http://localhost:3001/api/invites/'+slug+'/rsvp',{data:{status:'declined',reason:'Trying to undo attendance'}});assert.equal(denied.status(),409);
+ const again=await guest.request.post('http://localhost:3001/api/invites/'+slug+'/rsvp',{data:{status:'attending'}});assert.equal(again.status(),200);
+ const locked=await (await context.request.get('http://localhost:3001/api/invites')).json();assert.equal(locked[0].status,'attending');assert.equal(locked[0].responseHistory.length,2,'Repeated confirmation must not append history');
+ const fresh=await browser.newPage();await fresh.goto('http://localhost:3001/'+slug);await fresh.getByRole('heading',{name:'You’re on the guest list.'}).waitFor();assert.equal(await fresh.locator('#decline').count(),0);await fresh.close();
+ await guest.screenshot({path:'/tmp/birthday-light.png',fullPage:true,animations:'disabled'});
+ await page.getByRole('button',{name:'Responses',exact:true}).click();
+ await page.reload();await page.getByRole('button',{name:'Responses',exact:true}).first().click();
+ await page.getByRole('heading',{name:'Every RSVP. Every story.'}).waitFor();await page.screenshot({path:'/tmp/birthday-admin.png',fullPage:true,animations:'disabled'});await page.locator('[data-response]').click();await page.getByText('Travelling with family.',{exact:true}).waitFor();
+ const musicPage=await browser.newPage({viewport:{width:390,height:844}});
+ await musicPage.route('https://www.youtube.com/iframe_api',route=>route.fulfill({contentType:'application/javascript',body:`window.YT={Player:class{constructor(id,opts){this.opts=opts;setTimeout(()=>opts.events.onReady(),0)}unMute(){}playVideo(){this.opts.events.onStateChange({data:1})}pauseVideo(){this.opts.events.onStateChange({data:2})}}};window.onYouTubeIframeAPIReady();`}));
+ await musicPage.route('https://www.youtube.com/embed/**',route=>route.fulfill({contentType:'text/html',body:'<p>Test video player</p>'}));
+ await musicPage.route('**/api/invites/demo',async route=>{const response=await route.fetch();const data=await response.json();data.songId='M7lc1UVf-VE';await route.fulfill({json:data});});
+ const doc=await musicPage.goto('http://localhost:3001/demo');assert.equal(doc.headers()['referrer-policy'],'strict-origin-when-cross-origin');
+ await musicPage.getByRole('button',{name:'Pause song',exact:true}).waitFor();
+ const frame=musicPage.locator('#youtube-frame');assert.equal(await frame.getAttribute('aria-hidden'),'true');assert.equal(await frame.evaluate(el=>el.getBoundingClientRect().right<0),true);assert.equal(await frame.getAttribute('referrerpolicy'),'strict-origin-when-cross-origin');assert.match(await frame.getAttribute('allow'),/autoplay/);
+ await musicPage.getByRole('button',{name:'Pause song',exact:true}).click();await musicPage.getByText('Paused.',{exact:true}).waitFor();await musicPage.getByRole('button',{name:'Play song',exact:true}).click();await musicPage.getByRole('button',{name:'Pause song',exact:true}).waitFor();
+ await musicPage.close();
+ assert.deepEqual(errors,[]);
+ await context.request.delete('http://localhost:3001/api/invites/'+slug,{headers:{'x-csrf-token':session.csrf}});
+ }finally{await browser?.close();server.kill();await rm(uploadDir,{recursive:true,force:true});}
+});
