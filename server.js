@@ -69,7 +69,7 @@ async function normalizeLocalPhoto(buffer,filename,field){
  if(/\.(heic|heif)$/i.test(filename))input=await convertHeic({buffer,format:'JPEG',quality:.92});
  return sharp(input,{limitInputPixels:100000000}).rotate().resize(field==='profile'?800:1600,field==='profile'?800:1600,{fit:field==='profile'?'cover':'inside',withoutEnlargement:field!=='profile'}).webp({quality:86}).toBuffer();
 }
-app.get('/api/upload-config',admin,(req,res)=>res.json({direct:production&&!!process.env.BLOB_READ_WRITE_TOKEN}));
+app.get('/api/upload-config',admin,(req,res)=>res.json({direct:production&&!!process.env.BLOB_READ_WRITE_TOKEN,storageRequired:production}));
 app.post('/api/blob-upload',async(req,res)=>{
  try{
   const result=await handleUpload({body:req.body,request:req,
@@ -101,7 +101,7 @@ app.post('/api/blob-upload',async(req,res)=>{
    }
   });
   res.json(result);
- }catch(error){res.status(400).json({error:error.message||'Unable to start the upload.'});}
+ }catch(error){console.error('Photo upload processing failed:',error.message);res.status(400).json({error:error.message||'Unable to start the upload.'});}
 });
 app.get('/api/session',(req,res)=>res.json({authenticated:!!req.session.admin,csrf:req.session.admin?req.session.csrf:undefined,demoMode}));
 app.post('/api/login',rateLimit({windowMs:15*60000,limit:10}),async(req,res,next)=>{try{const ok=await bcrypt.compare(String(req.body.password||''),passwordHash);if(req.body.username!==(process.env.ADMIN_USERNAME||'pravith17')||!ok)return res.status(401).json({error:'Incorrect username or password.'});req.session.regenerate(err=>{if(err)return next(err);req.session.admin=true;req.session.csrf=randomBytes(32).toString('hex');req.session.save(err=>err?next(err):res.json({csrf:req.session.csrf}));});}catch(e){next(e);}});
@@ -117,7 +117,7 @@ app.post('/api/invites/:slug/profile-photo',admin,csrf,upload.single('profilePho
  const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});
  if(!req.file)return res.status(400).json({error:'Choose a profile picture.'});
  let file;
- try{const buffer=await normalizeLocalPhoto(req.file.buffer,req.file.originalname,'profile');file='/uploads/'+randomUUID()+'.webp';await writeFile(path.join(uploadsDir,path.basename(file)),buffer);const saved=await saveInvite(invite.slug,{profilePhoto:file});if(invite.profilePhoto)await deletePhoto(invite.profilePhoto);res.json(saved);}catch{if(file)await unlink(path.join(uploadsDir,path.basename(file))).catch(()=>{});res.status(400).json({error:'This image could not be decoded. Try a supported image file, including HEIC or HEIF.'});}
+ try{const buffer=await normalizeLocalPhoto(req.file.buffer,req.file.originalname,'profile');file='/uploads/'+randomUUID()+'.webp';await writeFile(path.join(uploadsDir,path.basename(file)),buffer);const saved=await saveInvite(invite.slug,{profilePhoto:file});if(invite.profilePhoto)await deletePhoto(invite.profilePhoto);res.json(saved);}catch(error){console.error('Profile photo processing/storage failed:',{mime:req.file.mimetype,bytes:req.file.size,extension:path.extname(req.file.originalname).toLowerCase(),message:error.message});if(file)await unlink(path.join(uploadsDir,path.basename(file))).catch(()=>{});res.status(400).json({error:'The photo could not be processed or saved. On Vercel, connect a Blob store in Storage and redeploy; on other hosts, check photo storage permissions and supported image formats.'});}
 });
 app.get('/api/attendees',async(req,res)=>{
  const guests=demoMode?[...memory.values()].filter(i=>i.status==='attending'):await Invite.find({status:'attending'}).select('name -_id').lean();
