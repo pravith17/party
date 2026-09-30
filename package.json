@@ -6,21 +6,25 @@
   "scripts": {
     "start": "node --env-file=.env server.js",
     "dev": "node --env-file=.env --watch server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "build:upload": "esbuild public/blob-client-entry.js --bundle --format=iife --target=es2020 --outfile=public/blob-client.js"
   },
   "dependencies": {
+    "@vercel/blob": "^2.8.0",
     "bcryptjs": "^3.0.2",
     "connect-mongo": "^5.1.0",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
     "express-session": "^1.18.2",
+    "heic-convert": "^2.1.0",
     "helmet": "^8.1.0",
     "mongoose": "^8.19.0",
     "multer": "^2.0.2",
     "sharp": "^0.35.5"
   },
   "devDependencies": {
-    "@playwright/test": "^1.55.1"
+    "@playwright/test": "^1.55.1",
+    "esbuild": "^0.28.2"
   }
 }

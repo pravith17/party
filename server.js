@@ -8,6 +8,10 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import multer from 'multer';
 import sharp from 'sharp';
+import convertHeic from 'heic-convert';
+import { handleUpload } from '@vercel/blob/client';
+import { put, del } from '@vercel/blob';
+import { Readable } from 'node:stream';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, writeFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
@@ -38,13 +42,67 @@ const saveInvite = async (slug, changes)=> { if(demoMode) { const v={...memory.g
 const demoInvite = { name:'friend', slug:'demo', message:'We’re celebrating our birthdays together, and would love you to join us.', songId:'', songUrl:'', photos:[], status:'pending', views:0, responseHistory:[] };
 const app = express();
 app.set('trust proxy', 1);
-app.use(helmet({referrerPolicy:{policy:'strict-origin-when-cross-origin'},contentSecurityPolicy:{directives:{defaultSrc:["'self'"],scriptSrc:["'self'",'https://www.youtube.com','https://s.ytimg.com'],styleSrc:["'self'","'unsafe-inline'",'https://fonts.googleapis.com'],fontSrc:["'self'",'https://fonts.gstatic.com'],imgSrc:["'self'",'data:','blob:'],frameSrc:['https://www.youtube.com','https://www.youtube-nocookie.com'],connectSrc:["'self'"],upgradeInsecureRequests:production?[]:null}},crossOriginEmbedderPolicy:false}));
+app.use(helmet({referrerPolicy:{policy:'strict-origin-when-cross-origin'},contentSecurityPolicy:{directives:{defaultSrc:["'self'"],scriptSrc:["'self'",'https://www.youtube.com','https://s.ytimg.com'],styleSrc:["'self'","'unsafe-inline'",'https://fonts.googleapis.com'],fontSrc:["'self'",'https://fonts.gstatic.com'],imgSrc:["'self'",'data:','blob:','https://*.public.blob.vercel-storage.com'],frameSrc:['https://www.youtube.com','https://www.youtube-nocookie.com'],connectSrc:["'self'",'https://*.blob.vercel-storage.com'],upgradeInsecureRequests:production?[]:null}},crossOriginEmbedderPolicy:false}));
 app.use(express.json({limit:'64kb'}));
 app.use(session({ name:'birthday.sid', secret:process.env.SESSION_SECRET, resave:false, saveUninitialized:false, cookie:{httpOnly:true,sameSite:'lax',secure:production,maxAge:8*60*60*1000}, ...(demoMode?{}:{store:MongoStore.create({client:mongoose.connection.getClient(),collectionName:'sessions'})}) }));
 app.use('/api',rateLimit({windowMs:60000,limit:180,standardHeaders:'draft-8',legacyHeaders:false}));
 app.use('/api', (req,res,next)=> {res.set('Cache-Control','no-store'); if(['POST','PUT','PATCH','DELETE'].includes(req.method)){ const origin=req.get('origin'); if(origin && origin !== new URL(process.env.PUBLIC_URL || `http://localhost:${process.env.PORT||3000}`).origin) return res.status(403).json({error:'Request origin is not allowed.'}); } next(); });
 const admin = (req,res,next)=>req.session.admin?next():res.status(401).json({error:'Please sign in.'});
 const csrf = (req,res,next)=> { const a=Buffer.from(req.get('x-csrf-token')||''); const b=Buffer.from(req.session.csrf||''); return a.length && a.length===b.length && timingSafeEqual(a,b)? next():res.status(403).json({error:'Session expired. Refresh and try again.'}); };
+const blobPhoto = url => /^https:\/\/[^/]+\.public\.blob\.vercel-storage\.com\//.test(url||'');
+async function deletePhoto(url){if(!url)return;if(blobPhoto(url))await del(url).catch(()=>{});else await unlink(path.join(uploadsDir,path.basename(url))).catch(()=>{});}
+async function normalizeBlobPhoto(blob,field){
+ const response=await fetch(blob.url);if(!response.ok||!response.body)throw Error('Could not read uploaded image.');
+ let output;
+ if(/\.(heic|heif)$/i.test(blob.pathname)||/^image\/(heic|heif)/i.test(blob.contentType||'')){
+  const input=Buffer.from(await response.arrayBuffer());
+  const jpeg=await convertHeic({buffer:input,format:'JPEG',quality:.92});
+  output=await sharp(jpeg,{limitInputPixels:100000000}).rotate().resize(field==='profile'?800:1600,field==='profile'?800:1600,{fit:field==='profile'?'cover':'inside',withoutEnlargement:field!=='profile'}).webp({quality:86}).toBuffer();
+ }else{
+  const image=sharp(undefined,{limitInputPixels:100000000}).rotate().resize(field==='profile'?800:1600,field==='profile'?800:1600,{fit:field==='profile'?'cover':'inside',withoutEnlargement:field!=='profile'}).webp({quality:86});
+  const outputPromise=image.toBuffer();Readable.fromWeb(response.body).pipe(image);output=await outputPromise;
+ }
+ return put(`party/photos/${randomUUID()}.webp`,output,{access:'public',contentType:'image/webp',addRandomSuffix:true,cacheControlMaxAge:31536000});
+}
+async function normalizeLocalPhoto(buffer,filename,field){
+ let input=buffer;
+ if(/\.(heic|heif)$/i.test(filename))input=await convertHeic({buffer,format:'JPEG',quality:.92});
+ return sharp(input,{limitInputPixels:100000000}).rotate().resize(field==='profile'?800:1600,field==='profile'?800:1600,{fit:field==='profile'?'cover':'inside',withoutEnlargement:field!=='profile'}).webp({quality:86}).toBuffer();
+}
+app.get('/api/upload-config',admin,(req,res)=>res.json({direct:production&&!!process.env.BLOB_READ_WRITE_TOKEN}));
+app.post('/api/blob-upload',async(req,res)=>{
+ try{
+  const result=await handleUpload({body:req.body,request:req,
+   onBeforeGenerateToken:async(pathname,clientPayload)=>{
+    if(!req.session.admin)throw Error('Please sign in before uploading.');
+    const supplied=Buffer.from(req.get('x-csrf-token')||''),expected=Buffer.from(req.session.csrf||'');
+    if(!supplied.length||supplied.length!==expected.length||!timingSafeEqual(supplied,expected))throw Error('Session expired. Refresh and try again.');
+    let target;try{target=JSON.parse(clientPayload||'{}');}catch{throw Error('Invalid upload details.');}
+    if(!validSlug(target.slug)||!['profile','memory'].includes(target.field))throw Error('Invalid upload target.');
+    const invite=await getInvite(target.slug);if(!invite)throw Error('Invitation not found.');
+    if(target.field==='memory'&&(invite.photos?.length||0)>=12)throw Error('This invitation already has 12 photos.');
+    return {allowedContentTypes:['image/jpeg','image/png','image/webp','image/avif','image/gif','image/tiff','image/bmp','image/svg+xml','image/heic','image/heif','image/heic-sequence','image/heif-sequence','image/x-icon','image/jxl','application/octet-stream'],addRandomSuffix:true,multipart:true,tokenPayload:JSON.stringify({slug:target.slug,field:target.field})};
+   },
+   onUploadCompleted:async({blob,tokenPayload})=>{
+    const {slug,field}=JSON.parse(tokenPayload||'{}');
+    if(!validSlug(slug)||!['profile','memory'].includes(field))throw Error('Invalid upload metadata.');
+    const invite=await getInvite(slug);if(!invite){await del(blob.url).catch(()=>{});throw Error('Invitation was removed.');}
+    try{
+     const image=await normalizeBlobPhoto(blob,field);
+     if(field==='profile'){
+      await saveInvite(slug,{profilePhoto:image.url});
+      if(invite.profilePhoto)await deletePhoto(invite.profilePhoto);
+     }else{
+      if((invite.photos?.length||0)>=12){await del(image.url).catch(()=>{});throw Error('This invitation already has 12 photos.');}
+      await saveInvite(slug,{photos:[...(invite.photos||[]),image.url]});
+     }
+     await del(blob.url).catch(()=>{});
+    }catch(error){await del(blob.url).catch(()=>{});throw error;}
+   }
+  });
+  res.json(result);
+ }catch(error){res.status(400).json({error:error.message||'Unable to start the upload.'});}
+});
 app.get('/api/session',(req,res)=>res.json({authenticated:!!req.session.admin,csrf:req.session.admin?req.session.csrf:undefined,demoMode}));
 app.post('/api/login',rateLimit({windowMs:15*60000,limit:10}),async(req,res,next)=>{try{const ok=await bcrypt.compare(String(req.body.password||''),passwordHash);if(req.body.username!==(process.env.ADMIN_USERNAME||'pravith17')||!ok)return res.status(401).json({error:'Incorrect username or password.'});req.session.regenerate(err=>{if(err)return next(err);req.session.admin=true;req.session.csrf=randomBytes(32).toString('hex');req.session.save(err=>err?next(err):res.json({csrf:req.session.csrf}));});}catch(e){next(e);}});
 app.post('/api/logout',admin,csrf,(req,res)=>req.session.destroy(()=>{res.clearCookie('birthday.sid');res.json({ok:true});}));
@@ -59,15 +117,15 @@ app.post('/api/invites/:slug/profile-photo',admin,csrf,upload.single('profilePho
  const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});
  if(!req.file)return res.status(400).json({error:'Choose a profile picture.'});
  let file;
- try{const buffer=await sharp(req.file.buffer,{limitInputPixels:40000000}).rotate().resize(800,800,{fit:'cover'}).webp({quality:85}).toBuffer();file='/uploads/'+randomUUID()+'.webp';await writeFile(path.join(uploadsDir,path.basename(file)),buffer);const saved=await saveInvite(invite.slug,{profilePhoto:file});if(invite.profilePhoto)await unlink(path.join(uploadsDir,path.basename(invite.profilePhoto))).catch(()=>{});res.json(saved);}catch{if(file)await unlink(path.join(uploadsDir,path.basename(file))).catch(()=>{});res.status(400).json({error:'Choose a valid JPG, PNG or WebP profile picture, up to 8 MB.'});}
+ try{const buffer=await normalizeLocalPhoto(req.file.buffer,req.file.originalname,'profile');file='/uploads/'+randomUUID()+'.webp';await writeFile(path.join(uploadsDir,path.basename(file)),buffer);const saved=await saveInvite(invite.slug,{profilePhoto:file});if(invite.profilePhoto)await deletePhoto(invite.profilePhoto);res.json(saved);}catch{if(file)await unlink(path.join(uploadsDir,path.basename(file))).catch(()=>{});res.status(400).json({error:'This image could not be decoded. Try a supported image file, including HEIC or HEIF.'});}
 });
 app.get('/api/attendees',async(req,res)=>{
  const guests=demoMode?[...memory.values()].filter(i=>i.status==='attending'):await Invite.find({status:'attending'}).select('name -_id').lean();
  res.json(guests.map(i=>({name:i.name})).sort((a,b)=>a.name.localeCompare(b.name)));
 });
-app.post('/api/invites/:slug/photos',admin,csrf,upload.array('photos',12),async(req,res)=>{const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});if(!req.files?.length)return res.status(400).json({error:'Choose at least one photo.'});if(invite.photos.length+req.files.length>12)return res.status(400).json({error:'Use up to 12 photos per invitation.'});const made=[];try{for(const file of req.files){const buffer=await sharp(file.buffer,{limitInputPixels:40000000}).rotate().resize(1600,1600,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toBuffer();const name=randomUUID()+'.webp';await writeFile(path.join(uploadsDir,name),buffer);made.push('/uploads/'+name);}res.json(await saveInvite(invite.slug,{photos:[...invite.photos,...made]}));}catch{await Promise.all(made.map(f=>unlink(path.join(uploadsDir,path.basename(f))).catch(()=>{})));res.status(400).json({error:'Upload valid JPG, PNG, WebP or HEIC photos supported by this server.'});}});
-app.delete('/api/invites/:slug/photos/:filename',admin,csrf,async(req,res)=>{const invite=await getInvite(req.params.slug);const file='/uploads/'+req.params.filename;if(!invite||!invite.photos.includes(file))return res.status(404).json({error:'Photo not found.'});const updated=await saveInvite(invite.slug,{photos:invite.photos.filter(p=>p!==file)});await unlink(path.join(uploadsDir,path.basename(file))).catch(()=>{});res.json(updated);});
-app.delete('/api/invites/:slug',admin,csrf,async(req,res)=>{const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});if(demoMode)memory.delete(invite.slug);else await Invite.deleteOne({slug:invite.slug});await Promise.all([...(invite.photos||[]),...(invite.profilePhoto?[invite.profilePhoto]:[])].map(p=>unlink(path.join(uploadsDir,path.basename(p))).catch(()=>{})));res.json({ok:true});});
+app.post('/api/invites/:slug/photos',admin,csrf,upload.array('photos',12),async(req,res)=>{const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});if(!req.files?.length)return res.status(400).json({error:'Choose at least one photo.'});if(invite.photos.length+req.files.length>12)return res.status(400).json({error:'Use up to 12 photos per invitation.'});const made=[];try{for(const file of req.files){const buffer=await normalizeLocalPhoto(file.buffer,file.originalname,'memory');const name=randomUUID()+'.webp';await writeFile(path.join(uploadsDir,name),buffer);made.push('/uploads/'+name);}res.json(await saveInvite(invite.slug,{photos:[...invite.photos,...made]}));}catch{await Promise.all(made.map(f=>unlink(path.join(uploadsDir,path.basename(f))).catch(()=>{})));res.status(400).json({error:'This image could not be decoded. Try a supported image file, including HEIC or HEIF.'});}});
+app.delete('/api/invites/:slug/photos',admin,csrf,async(req,res)=>{const invite=await getInvite(req.params.slug);const file=String(req.query.url||'');if(!invite||!invite.photos.includes(file))return res.status(404).json({error:'Photo not found.'});const updated=await saveInvite(invite.slug,{photos:invite.photos.filter(p=>p!==file)});await deletePhoto(file);res.json(updated);});
+app.delete('/api/invites/:slug',admin,csrf,async(req,res)=>{const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});if(demoMode)memory.delete(invite.slug);else await Invite.deleteOne({slug:invite.slug});await Promise.all([...(invite.photos||[]),...(invite.profilePhoto?[invite.profilePhoto]:[])].map(deletePhoto));res.json({ok:true});});
 app.get('/api/invites/:slug',async(req,res)=>{const invite=req.params.slug==='demo'?{...demoInvite}:await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'This invitation isn’t on the list. Check your link with Pravith or Abhishek.'});if(invite.slug!=='demo'){if(demoMode)await saveInvite(invite.slug,{views:(invite.views||0)+1,lastViewedAt:new Date()});else await Invite.updateOne({slug:invite.slug},{$inc:{views:1},$set:{lastViewedAt:new Date()}});}res.json({name:invite.name,description:invite.description||'',profilePhoto:invite.profilePhoto||'',slug:invite.slug,message:invite.message,songId:invite.songId,photos:invite.photos,status:invite.status,settings:await getSettings()});});
 app.post('/api/invites/:slug/rsvp',rateLimit({windowMs:60000,limit:30}),async(req,res)=>{
  if(!['attending','declined'].includes(req.body.status))return res.status(400).json({error:'Choose a response.'});

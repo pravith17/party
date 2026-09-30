@@ -42,14 +42,25 @@ Changing an invitation’s URL invalidates its previous link. Deleting an invita
 
 ## Deploy to your domain
 
-This app requires a Node.js host, MongoDB connectivity and a **persistent disk** for `uploads/`. It is not a static-only site. The supplied MongoDB driver requires network sockets, so it cannot run unchanged on the Sites hosting runtime.
+This app needs a Node.js host and MongoDB connectivity. Self-hosted uploads need persistent disk for `uploads/`; on Vercel, use the Blob setup below for durable photo storage and large direct uploads. It is not a static-only site. The supplied MongoDB driver requires network sockets.
 
 1. Deploy this directory to your Node.js server. Install dependencies with `npm ci --omit=dev`.
 2. Set the environment values from `.env.example` on the host. Set `NODE_ENV=production`, a random `SESSION_SECRET`, the administrator credentials, and `PUBLIC_URL=https://your-domain.com`. This URL must match the actual browser origin; it protects writes from cross-site requests.
 3. Start `node server.js` behind one trusted reverse proxy with HTTPS. `trust proxy` is set to one hop. Adapt this to your host’s proxy topology.
 4. Configure MongoDB Atlas network access for the server. Give the database user access to the `birthday_club` database.
-5. Mount persistent storage at the project’s `uploads/` directory (or set `UPLOAD_DIR` to an absolute disk path) and back it up together with MongoDB. Use one app instance with the current filesystem upload storage, or provide shared storage before scaling to multiple instances.
+5. For self-hosting, mount persistent storage at `uploads/` (or set `UPLOAD_DIR`) and back it up together with MongoDB.
 6. Point your domain to the host and verify login, uploads and one guest RSVP.
+
+### Vercel photo storage and large uploads
+
+Vercel Functions reject request bodies above 4.5 MB, so this app sends photos directly from the browser to Vercel Blob using multipart uploads. The server then converts supported formats—including HEIC/HEIF—to optimized WebP images. There is no app-level byte-size limit on direct uploads; Vercel Blob’s own transfer limits and image-decoder memory limits still apply.
+
+1. In the Vercel project, open **Storage → Create Database → Blob** and create a public Blob store.
+2. Connect the store to the `party` project and make sure `BLOB_READ_WRITE_TOKEN` is available in Production (and Preview if you use preview deployments). Vercel normally adds this variable when you connect the store.
+3. Redeploy after connecting storage or changing the token.
+4. Open `/admin`, upload a large JPG and an iPhone HEIC photo, then check that both appear in the invitation.
+
+The app accepts common image formats (JPEG, PNG, WebP, AVIF, GIF, TIFF, BMP, SVG, HEIC/HEIF). Unsupported proprietary camera RAW formats cannot be guaranteed; those may need conversion to JPEG first.
 
 Guest URLs become `https://your-domain.com/custom-guest-name` automatically.
 
