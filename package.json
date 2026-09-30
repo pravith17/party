@@ -6,8 +6,7 @@
   "scripts": {
     "start": "node --env-file=.env server.js",
     "dev": "node --env-file=.env --watch server.js",
-    "test": "node --test",
-    "build:upload": "esbuild public/blob-client-entry.js --bundle --format=iife --target=es2020 --outfile=public/blob-client.js"
+    "test": "node --test"
   },
   "dependencies": {
     "@vercel/blob": "^2.8.0",
@@ -24,7 +23,6 @@
     "sharp": "^0.35.5"
   },
   "devDependencies": {
-    "@playwright/test": "^1.55.1",
-    "esbuild": "^0.28.2"
+    "@playwright/test": "^1.55.1"
   }
 }

@@ -23,7 +23,7 @@ The provided administrator credentials and database connection are configured in
 1. Sign in at `/admin`.
 2. Open **Party settings**. Set the date, time, time zone, venue, exact address, map link, dress code, welcome message, thank-you note, and farewell note.
 3. Choose **New invitation**, enter a name, add a profile picture and a description about the person, customize the URL, write a personal message, and paste a YouTube video link.
-4. Save the invitation, then upload up to 12 photos (8 MB each). Photos are decoded, resized, stripped of metadata and saved as WebP.
+4. Save the invitation, then upload up to 12 photos in common formats, including HEIC/HEIF. Photos are optimized as WebP and stored in MongoDB GridFS.
 5. Copy the invitation link. The guest can view it without signing in. Anyone with that link can view the invitation and submit a response, so share guest links individually. Once attendance is confirmed, the server permanently locks it; a decline cannot overwrite it, even from a different browser or a simultaneous request.
 6. View guests, filters, latest responses and response histories in the dashboard. Export responses as CSV when needed.
 
@@ -42,25 +42,19 @@ Changing an invitation’s URL invalidates its previous link. Deleting an invita
 
 ## Deploy to your domain
 
-This app needs a Node.js host and MongoDB connectivity. Self-hosted uploads need persistent disk for `uploads/`; on Vercel, use the Blob setup below for durable photo storage and large direct uploads. It is not a static-only site. The supplied MongoDB driver requires network sockets.
+This app needs a Node.js host and MongoDB connectivity. Production photos are optimized and stored in MongoDB GridFS; local demo mode uses temporary files. It is not a static-only site.
 
 1. Deploy this directory to your Node.js server. Install dependencies with `npm ci --omit=dev`.
 2. Set the environment values from `.env.example` on the host. Set `NODE_ENV=production`, a random `SESSION_SECRET`, the administrator credentials, and `PUBLIC_URL=https://your-domain.com`. This URL must match the actual browser origin; it protects writes from cross-site requests.
 3. Start `node server.js` behind one trusted reverse proxy with HTTPS. `trust proxy` is set to one hop. Adapt this to your host’s proxy topology.
 4. Configure MongoDB Atlas network access for the server. Give the database user access to the `birthday_club` database.
-5. For self-hosting, mount persistent storage at `uploads/` (or set `UPLOAD_DIR`) and back it up together with MongoDB.
-6. Point your domain to the host and verify login, uploads and one guest RSVP.
+5. Point your domain to the host and verify login, photo uploads and one guest RSVP.
 
-### Vercel photo storage and large uploads
+### Photo storage on Vercel
 
-Vercel Functions reject request bodies above 4.5 MB, so this app sends photos directly from the browser to Vercel Blob using multipart uploads. The server then converts supported formats—including HEIC/HEIF—to optimized WebP images. There is no app-level byte-size limit on direct uploads; Vercel Blob’s own transfer limits and image-decoder memory limits still apply.
+Photos are stored in MongoDB GridFS alongside the app’s existing invitation data. The browser sends each photo to the server in 3 MiB chunks, so the 4.5 MB Vercel Function request-body limit does not block large uploads. The server converts supported images—including iPhone HEIC/HEIF—to optimized WebP and saves the result in GridFS. No separate Vercel Blob store is required. MongoDB GridFS stores files as multiple database documents, which supports images larger than MongoDB’s 16 MiB per-document limit.
 
-1. In the Vercel project, open **Storage → Create Database → Blob** and create a public Blob store.
-2. Connect the store to the `party` project and make sure `BLOB_READ_WRITE_TOKEN` is available in Production (and Preview if you use preview deployments). Vercel normally adds this variable when you connect the store.
-3. Redeploy after connecting storage or changing the token.
-4. Open `/admin`, upload a large JPG and an iPhone HEIC photo, then check that both appear in the invitation.
-
-The app accepts common image formats (JPEG, PNG, WebP, AVIF, GIF, TIFF, BMP, SVG, HEIC/HEIF). Unsupported proprietary camera RAW formats cannot be guaranteed; those may need conversion to JPEG first.
+Make sure the existing MongoDB Atlas user can read and write in the app database and that Atlas allows connections from the Vercel deployment. Large photo collections use your MongoDB storage quota.
 
 Guest URLs become `https://your-domain.com/custom-guest-name` automatically.
 
