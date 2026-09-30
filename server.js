@@ -7,8 +7,6 @@ import bcrypt from 'bcryptjs';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import multer from 'multer';
-import sharp from 'sharp';
-import convertHeic from 'heic-convert';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { del } from '@vercel/blob';
@@ -66,16 +64,10 @@ async function deletePhoto(url){
  if(url.startsWith('/media/')&&!demoMode){const id=url.slice('/media/'.length);if(mongoose.isValidObjectId(id))await photoBucket.delete(new mongoose.Types.ObjectId(id)).catch(()=>{});return;}
  await unlink(path.join(uploadsDir,path.basename(url))).catch(()=>{});
 }
-async function normalizeLocalPhoto(buffer,filename,field){
- let input=buffer;
- if(/\.(heic|heif)$/i.test(filename))input=await convertHeic({buffer,format:'JPEG',quality:.92});
- return sharp(input,{limitInputPixels:100000000}).rotate().resize(field==='profile'?800:1600,field==='profile'?800:1600,{fit:field==='profile'?'cover':'inside',withoutEnlargement:field!=='profile'}).webp({quality:86}).toBuffer();
-}
 async function uploadedImageStream(upload){
  const cursor=PhotoUploadPart.find({uploadId:upload._id}).sort({index:1}).select('data').lean().cursor();
  return Readable.from((async function*(){for await(const part of cursor)yield part.data;})());
 }
-function imageTransform(field){return sharp(undefined,{limitInputPixels:100000000}).rotate().resize(field==='profile'?800:1600,field==='profile'?800:1600,{fit:field==='profile'?'cover':'inside',withoutEnlargement:field!=='profile'}).webp({quality:86});}
 app.get('/api/upload-config',admin,(req,res)=>res.json({database:!demoMode}));
 app.post('/api/photo-uploads',admin,csrf,async(req,res)=>{
  const {slug,field}=req.body||{},size=Number(req.body?.size),filename=path.basename(String(req.body?.filename||''));
@@ -103,20 +95,16 @@ app.post('/api/photo-uploads/:id/complete',admin,csrf,async(req,res)=>{
  const invite=await getInvite(upload.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});
  if(upload.field==='memory'&&(invite.photos?.length||0)>=12)return res.status(400).json({error:'This invitation already has 12 photos.'});
  let output,committed=false;try{
-  let source=await uploadedImageStream(upload);
-  if(/\.(heic|heif)$/i.test(upload.filename)||/^image\/(heic|heif)/i.test(upload.contentType||'')){
-   const parts=[];for await(const part of source)parts.push(part);
-   const jpeg=await convertHeic({buffer:Buffer.concat(parts),format:'JPEG',quality:.92});source=Readable.from([jpeg]);
-  }
-  output=photoBucket.openUploadStream(`${randomUUID()}.webp`,{metadata:{slug:upload.slug,field:upload.field,contentType:'image/webp'}});
-  await pipeline(source,imageTransform(upload.field),output);
+  const contentType=/^image\/[a-z0-9.+-]+$/i.test(upload.contentType||'')?upload.contentType:'application/octet-stream';
+  output=photoBucket.openUploadStream(upload.filename,{metadata:{slug:upload.slug,field:upload.field,contentType,originalName:upload.filename}});
+  await pipeline(await uploadedImageStream(upload),output);
   const imageUrl=`/media/${output.id}`;
   const updated=upload.field==='profile'?await saveInvite(upload.slug,{profilePhoto:imageUrl}):await saveInvite(upload.slug,{photos:[...(invite.photos||[]),imageUrl]});
   committed=true;
   if(upload.field==='profile'&&invite.profilePhoto)await deletePhoto(invite.profilePhoto);
   await PhotoUploadPart.deleteMany({uploadId:upload._id}).catch(()=>{});await PhotoUpload.deleteOne({_id:upload._id}).catch(()=>{});
   res.json(updated);
- }catch(error){if(output?.id&&!committed)await photoBucket.delete(output.id).catch(()=>{});await PhotoUploadPart.deleteMany({uploadId:upload._id}).catch(()=>{});await PhotoUpload.deleteOne({_id:upload._id}).catch(()=>{});console.error('MongoDB photo conversion failed:',{mime:upload.contentType,bytes:upload.size,extension:path.extname(upload.filename).toLowerCase(),message:error.message});res.status(400).json({error:'This file could not be processed as an image. Try JPG, PNG, WebP, AVIF, GIF, TIFF, SVG, or HEIC/HEIF.'});}
+ }catch(error){if(output?.id&&!committed)await photoBucket.delete(output.id).catch(()=>{});await PhotoUploadPart.deleteMany({uploadId:upload._id}).catch(()=>{});await PhotoUpload.deleteOne({_id:upload._id}).catch(()=>{});console.error('MongoDB photo save failed:',{mime:upload.contentType,bytes:upload.size,extension:path.extname(upload.filename).toLowerCase(),message:error.message});res.status(500).json({error:'The original photo could not be saved to MongoDB. Please try again.'});}
 });
 app.delete('/api/photo-uploads/:id',admin,csrf,async(req,res)=>{
  if(!mongoose.isValidObjectId(req.params.id))return res.json({ok:true});
@@ -136,13 +124,13 @@ app.post('/api/invites/:slug/profile-photo',admin,csrf,upload.single('profilePho
  const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});
  if(!req.file)return res.status(400).json({error:'Choose a profile picture.'});
  let file;
- try{const buffer=await normalizeLocalPhoto(req.file.buffer,req.file.originalname,'profile');file='/uploads/'+randomUUID()+'.webp';await writeFile(path.join(uploadsDir,path.basename(file)),buffer);const saved=await saveInvite(invite.slug,{profilePhoto:file});if(invite.profilePhoto)await deletePhoto(invite.profilePhoto);res.json(saved);}catch(error){console.error('Profile photo processing/storage failed:',{mime:req.file.mimetype,bytes:req.file.size,extension:path.extname(req.file.originalname).toLowerCase(),message:error.message});if(file)await unlink(path.join(uploadsDir,path.basename(file))).catch(()=>{});res.status(400).json({error:'The photo could not be processed or saved. Try a supported image format and check the server logs for details.'});}
+ try{const ext=path.extname(req.file.originalname).slice(0,16);file='/uploads/'+randomUUID()+ext;await writeFile(path.join(uploadsDir,path.basename(file)),req.file.buffer);const saved=await saveInvite(invite.slug,{profilePhoto:file});if(invite.profilePhoto)await deletePhoto(invite.profilePhoto);res.json(saved);}catch(error){console.error('Profile photo save failed:',{mime:req.file.mimetype,bytes:req.file.size,extension:path.extname(req.file.originalname).toLowerCase(),message:error.message});if(file)await unlink(path.join(uploadsDir,path.basename(file))).catch(()=>{});res.status(500).json({error:'The original photo could not be saved. Please try again.'});}
 });
 app.get('/api/attendees',async(req,res)=>{
  const guests=demoMode?[...memory.values()].filter(i=>i.status==='attending'):await Invite.find({status:'attending'}).select('name -_id').lean();
  res.json(guests.map(i=>({name:i.name})).sort((a,b)=>a.name.localeCompare(b.name)));
 });
-app.post('/api/invites/:slug/photos',admin,csrf,upload.array('photos',12),async(req,res)=>{const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});if(!req.files?.length)return res.status(400).json({error:'Choose at least one photo.'});if(invite.photos.length+req.files.length>12)return res.status(400).json({error:'Use up to 12 photos per invitation.'});const made=[];try{for(const file of req.files){const buffer=await normalizeLocalPhoto(file.buffer,file.originalname,'memory');const name=randomUUID()+'.webp';await writeFile(path.join(uploadsDir,name),buffer);made.push('/uploads/'+name);}res.json(await saveInvite(invite.slug,{photos:[...invite.photos,...made]}));}catch{await Promise.all(made.map(f=>unlink(path.join(uploadsDir,path.basename(f))).catch(()=>{})));res.status(400).json({error:'This image could not be decoded. Try a supported image file, including HEIC or HEIF.'});}});
+app.post('/api/invites/:slug/photos',admin,csrf,upload.array('photos',12),async(req,res)=>{const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});if(!req.files?.length)return res.status(400).json({error:'Choose at least one photo.'});if(invite.photos.length+req.files.length>12)return res.status(400).json({error:'Use up to 12 photos per invitation.'});const made=[];try{for(const file of req.files){const ext=path.extname(file.originalname).slice(0,16);const name=randomUUID()+ext;await writeFile(path.join(uploadsDir,name),file.buffer);made.push('/uploads/'+name);}res.json(await saveInvite(invite.slug,{photos:[...invite.photos,...made]}));}catch(error){await Promise.all(made.map(f=>unlink(path.join(uploadsDir,path.basename(f))).catch(()=>{})));console.error('Photo save failed:',error.message);res.status(500).json({error:'The original photos could not be saved. Please try again.'});}});
 app.delete('/api/invites/:slug/photos',admin,csrf,async(req,res)=>{const invite=await getInvite(req.params.slug);const file=String(req.query.url||'');if(!invite||!invite.photos.includes(file))return res.status(404).json({error:'Photo not found.'});const updated=await saveInvite(invite.slug,{photos:invite.photos.filter(p=>p!==file)});await deletePhoto(file);res.json(updated);});
 app.delete('/api/invites/:slug',admin,csrf,async(req,res)=>{const invite=await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'Invitation not found.'});if(demoMode)memory.delete(invite.slug);else await Invite.deleteOne({slug:invite.slug});await Promise.all([...(invite.photos||[]),...(invite.profilePhoto?[invite.profilePhoto]:[])].map(deletePhoto));res.json({ok:true});});
 app.get('/api/invites/:slug',async(req,res)=>{const invite=req.params.slug==='demo'?{...demoInvite}:await getInvite(req.params.slug);if(!invite)return res.status(404).json({error:'This invitation isn’t on the list. Check your link with Pravith or Abhishek.'});if(invite.slug!=='demo'){if(demoMode)await saveInvite(invite.slug,{views:(invite.views||0)+1,lastViewedAt:new Date()});else await Invite.updateOne({slug:invite.slug},{$inc:{views:1},$set:{lastViewedAt:new Date()}});}res.json({name:invite.name,description:invite.description||'',profilePhoto:invite.profilePhoto||'',slug:invite.slug,message:invite.message,songId:invite.songId,photos:invite.photos,status:invite.status,settings:await getSettings()});});
@@ -169,7 +157,8 @@ app.get('/media/:id',async(req,res)=>{
  const id=new mongoose.Types.ObjectId(req.params.id);const file=await photoBucket.find({_id:id}).next();if(!file)return res.sendStatus(404);
  const url=`/media/${id}`;const invite=await getInvite(file.metadata?.slug);const field=file.metadata?.field;
  if(!invite||!(field==='profile'?invite.profilePhoto===url:field==='memory'&&invite.photos?.includes(url)))return res.sendStatus(404);
- res.type('image/webp').set('Cache-Control','public, max-age=3600, immutable');const stream=photoBucket.openDownloadStream(id);stream.on('error',()=>{if(!res.headersSent)res.sendStatus(404);else res.destroy();});stream.pipe(res);
+ const contentType=/^image\/[a-z0-9.+-]+$/i.test(file.metadata?.contentType||'')?file.metadata.contentType:'application/octet-stream';
+ res.set({'Content-Type':contentType,'X-Content-Type-Options':'nosniff','Content-Disposition':'inline','Cache-Control':'public, max-age=3600, immutable'});const stream=photoBucket.openDownloadStream(id);stream.on('error',()=>{if(!res.headersSent)res.sendStatus(404);else res.destroy();});stream.pipe(res);
 });
 app.use('/uploads',express.static(uploadsDir,{maxAge:'7d',dotfiles:'deny'}));
 app.use(express.static(path.join(root,'public'),{index:false}));

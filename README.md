@@ -23,7 +23,7 @@ The provided administrator credentials and database connection are configured in
 1. Sign in at `/admin`.
 2. Open **Party settings**. Set the date, time, time zone, venue, exact address, map link, dress code, welcome message, thank-you note, and farewell note.
 3. Choose **New invitation**, enter a name, add a profile picture and a description about the person, customize the URL, write a personal message, and paste a YouTube video link.
-4. Save the invitation, then upload up to 12 photos in common formats, including HEIC/HEIF. Photos are optimized as WebP and stored in MongoDB GridFS.
+4. Save the invitation, then upload up to 12 photos in common formats, including HEIC/HEIF. Original photo bytes are stored in MongoDB GridFS without decoding or conversion.
 5. Copy the invitation link. The guest can view it without signing in. Anyone with that link can view the invitation and submit a response, so share guest links individually. Once attendance is confirmed, the server permanently locks it; a decline cannot overwrite it, even from a different browser or a simultaneous request.
 6. View guests, filters, latest responses and response histories in the dashboard. Export responses as CSV when needed.
 
@@ -42,7 +42,7 @@ Changing an invitation’s URL invalidates its previous link. Deleting an invita
 
 ## Deploy to your domain
 
-This app needs a Node.js host and MongoDB connectivity. Production photos are optimized and stored in MongoDB GridFS; local demo mode uses temporary files. It is not a static-only site.
+This app needs a Node.js host and MongoDB connectivity. Production photo files are stored unchanged in MongoDB GridFS; local demo mode uses temporary files. It is not a static-only site.
 
 1. Deploy this directory to your Node.js server. Install dependencies with `npm ci --omit=dev`.
 2. Set the environment values from `.env.example` on the host. Set `NODE_ENV=production`, a random `SESSION_SECRET`, the administrator credentials, and `PUBLIC_URL=https://your-domain.com`. This URL must match the actual browser origin; it protects writes from cross-site requests.
@@ -52,7 +52,7 @@ This app needs a Node.js host and MongoDB connectivity. Production photos are op
 
 ### Photo storage on Vercel
 
-Photos are stored in MongoDB GridFS alongside the app’s existing invitation data. The browser sends each photo to the server in 3 MiB chunks, so the 4.5 MB Vercel Function request-body limit does not block large uploads. The server converts supported images—including iPhone HEIC/HEIF—to optimized WebP and saves the result in GridFS. No separate Vercel Blob store is required. MongoDB GridFS stores files as multiple database documents, which supports images larger than MongoDB’s 16 MiB per-document limit.
+Photos are stored in MongoDB GridFS alongside the app’s existing invitation data. The browser sends each photo to the server in 3 MiB chunks, so the 4.5 MB Vercel Function request-body limit does not block large uploads. The server streams the original file bytes into GridFS without decoding, resizing, or converting them. No separate Vercel Blob store is required. MongoDB GridFS stores files as multiple database documents, which supports images larger than MongoDB’s 16 MiB per-document limit.
 
 Make sure the existing MongoDB Atlas user can read and write in the app database and that Atlas allows connections from the Vercel deployment. Large photo collections use your MongoDB storage quota.
 
